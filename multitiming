@@ -1,0 +1,130 @@
+import h5py
+import numpy as np
+import matplotlib.pyplot as plt
+import heapq
+from zmq_client import adc_to_voltage
+
+def get_times(y, fraction=0.4):
+    """
+    Returns pulse times in `y` by looking for the pulse
+    to cross a constant fraction `fraction` of the pulse height in each
+    waveform. `y` should be a 2 dimensional array with shape (N,M) where
+    N is the number of waveforms, and M is the number of samples per
+    waveform.
+    """
+    # samples below threshold
+    mask1 = y > np.min(y,axis=-1)[:,np.newaxis]*fraction
+    # samples before the minimum
+    mask2 = np.arange(y.shape[1]) < np.argmin(y,axis=-1)[:,np.newaxis]
+
+    # right side of threshold crossing
+    r = y.shape[1] - np.argmax((mask1 & mask2)[:,::-1], axis=-1)
+    r[r == 0] = 1
+    r[r == y.shape[1]] = y.shape[1] - 1
+    l = r - 1
+
+    yl = y[np.arange(y.shape[0]),l]
+    yr = y[np.arange(y.shape[0]),r]
+
+    return (np.min(y,axis=-1)*fraction - yl)/(yr-yl) + l
+
+def fft_filter(y, dt, cutoff=500e6):
+    """
+    Filter the array `y` by removing frequency components above
+    `cutoff` in Hz.
+    """
+    out = np.fft.rfft(y)
+    freq = np.fft.rfftfreq(y.shape[1], d=dt)
+    out[:,freq > cutoff] = 0
+    return np.fft.irfft(out)
+
+#Finds the amplitude of each of the charge curves with barrier
+def find_amp(v, size):
+        amplitude = np.min(v,axis=1)
+        #filteramp = amplitude[amplitude < -200]
+        filteramp = heapq.nsmallest(size, amplitude)
+        return np.absolute(filteramp)
+
+def get_window(v):
+    ind = np.argmin(v[np.min(v,axis=1) < -10],axis=1)
+    med = np.median(ind)
+    # 20 ns window
+    return med - 20, med + 20
+def main():
+    import matplotlib.pyplot as plt
+    import sys
+    import time
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-o', dest='output', default='multiming.txt')
+    parser.add_argument('filenames', nargs='+', help='input files')
+    parser.add_argument('-c', '--chunk', type=int, default=10000)
+    args = parser.parse_args()
+
+    t = [] #time resolution
+    q1 = [] #trigger charge
+    amp1 = [] #trigger amplitude
+    tt = [] #absolute time of trigger
+    q2 = [] #signal charge
+    amp2 = [] #signal amplitude
+    ts = [] #absolute time of signal
+
+    for filename in args.filenames:
+        print filename
+        with h5py.File(filename) as f:
+            start = time.time()
+            for i in range(0, f['c1'].shape[0], args.chunk):
+                y1 = adc_to_voltage(f['c1'][i:i+args.chunk])
+                y2 = adc_to_voltage(f['c2'][i:i+args.chunk])
+                # only accept c2 events below -10 mV
+                mask = np.min(y2,axis=-1) < -10e-3
+                #tony's new line
+                mask &= np.min(y1, axis=-1) < -100e-3
+                y1 = y1[mask]
+                y2 = y2[mask]
+                t1 = get_times(y1)*0.5 # sample -> ns
+                t2 = get_times(y2)*0.5
+
+                tt.extend(t1)
+                ts.extend(t2)
+
+                res = t2 - t1
+                t.extend(res)
+
+                dset = f['c1'][:100000]
+                l = len(res)
+                a1 = find_amp(dset, l)
+                amp1.extend(a1)
+
+                win1 = get_window(dset)
+                charge1 = -adc_to_voltage(np.trapz(dset[:,win1[0]:win1[1]]))*1e3/2/50.0
+                filtercharge1 = heapq.nsmallest(l, charge1)
+                q1.extend(filtercharge1)
+
+                dset2 = f['c2'][:100000]
+                a2 = find_amp(dset2, l)
+                amp2.extend(a2)
+
+                win2 = get_window(dset2)
+                charge2 = -adc_to_voltage(np.trapz(dset2[:,win2[0]:win2[1]]))*1e3/2/50.0
+                filtercharge2 = heapq.nsmallest(l, charge2)
+                q2.extend(filtercharge2)
+
+
+            stop = time.time()
+            print '%.2f seconds to process file' % (stop-start)
+
+        print len(t)
+        print len(q1)
+        print len(amp1)
+        print len(tt)
+        print len(q2)
+        print len(amp2)
+        print len(ts)
+
+    if args.output:
+        np.savetxt(args.output, np.c_[t,q1,amp1,tt,q2,amp2,ts])
+
+if __name__ == '__main__':
+    main()
